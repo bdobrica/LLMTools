@@ -18,9 +18,10 @@ def main():
     if not file_diffs:
         print("No changes detected against base branch.")
         sys.exit(0)
+    full_diff = reviewer.get_full_diff()
     pyright_results = reviewer.run_pyright_on_files(file_diffs)
     instructions = reviewer.get_instructions(args.instructions)
-    user_prompt = reviewer.build_prompt(file_diffs, pyright_results)
+    user_prompt = reviewer.build_prompt(file_diffs, pyright_results, full_diff)
     print("Sending to LLM...\n")
     response = reviewer.call_openai(instructions, user_prompt, model=args.model)
     print("----- LLM REVIEW OUTPUT -----")

@@ -1,0 +1,103 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Fetch Specific Commit
+        run: git fetch origin ${{ github.event.before }} ${{ github.event.after }}
+
+      - name: Dump GitHub context
+        env:
+            GITHUB_CONTEXT: ${{ toJson(github) }}
+        run: echo "$GITHUB_CONTEXT"
+
+      - name: Discover Docker Projects
+        id: discover
+        run: |
+          # Find all directories containing Dockerfiles
+          find . -name "Dockerfile" -type f | while read dockerfile; do
+            folder=$(dirname "$dockerfile")
+            folder=${folder#./}  # Remove leading ./
+            echo "$folder"
+          done > docker_projects.txt
+          
+          echo "Found Docker projects:"
+          cat docker_projects.txt
+
+      - name: Detect Changes in Docker Projects
+        id: changes
+        run: |
+          # Determine the commit range for git diff
+          echo "Using github.event.before"
+          commit_range="${{ github.event.before }}..${{ github.event.after }}"
+          
+          echo "Comparing changes in range: $commit_range"
+          git diff --name-only $commit_range > changed_files.txt
+          
+          # Check if any files in Docker project directories have changed
+          > changed_projects.txt
+          while IFS= read -r project; do
+            if grep -q "^$project/" changed_files.txt; then
+              echo "$project" >> changed_projects.txt
+            fi
+          done < docker_projects.txt
+          
+          echo "Changed Docker projects:"
+          cat changed_projects.txt
+
+      - name: Skip Build if No Changes
+        if: success()
+        run: |
+          if [[ ! -s changed_projects.txt ]]; then
+            echo "No changes in Docker projects. Skipping build."
+            exit 0
+          fi
+
+      - name: Set up Quay.io Authentication
+        run: |
+          mkdir -p $HOME/.docker
+          echo '{ "auths": { "quay.io": { "auth": "${{ secrets.QUAY_AUTH }}", "email": "" } } }' > $HOME/.docker/config.json
+
+      - name: Set up QEMU for Multiarch Builds
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and Push Changed Images
+        run: |
+          while IFS= read -r folder; do
+            # Check if this project has a .bumpversion.cfg file for version
+            if [[ -f "$folder/.bumpversion.cfg" ]]; then
+              version=$(grep -Po 'current_version = \K[\d.]+' "$folder/.bumpversion.cfg")
+            else
+              # Use git commit hash as version if no .bumpversion.cfg
+              version="${{ github.sha }}"
+            fi
+
+            echo "Building and pushing image for $folder with version $version..."
+
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg TARGETPLATFORM \
+              --file "$folder/Dockerfile" \
+              --tag "quay.io/${{ secrets.QUAY_USERNAME }}/$(basename $folder | tr '_' '-'):$version" \
+              --tag "quay.io/${{ secrets.QUAY_USERNAME }}/$(basename $folder | tr '_' '-'):latest" \
+              "$folder" --push
+          done < changed_projects.txt
