@@ -48,15 +48,24 @@ class LLMReviewer:
             git.Repo: The loaded git repository object.
 
         Raises:
-            SystemExit: If the path is not a valid git repository.
+            SystemExit: If the path is not a valid git repository or other git errors occur.
         """
         # Optionally set SSH key for Git
-        if self.ssh_key:
+        if self.ssh_key and Path(self.ssh_key).exists():
             os.environ["GIT_SSH_COMMAND"] = f"ssh -i {self.ssh_key}"
+        elif self.ssh_key:
+            print(f"Warning: SSH key not found at {self.ssh_key}", file=sys.stderr)
+
         try:
-            return git.Repo(self.repo_path, search_parent_directories=True)
+            repo = git.Repo(self.repo_path, search_parent_directories=True)
+            # Validate that we can access the repository
+            _ = repo.head.commit  # This will fail if repo is corrupted
+            return repo
         except git.exc.InvalidGitRepositoryError:
-            print("Error: Not a git repository.", file=sys.stderr)
+            print(f"Error: '{self.repo_path}' is not a valid git repository.", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error loading git repository: {e}", file=sys.stderr)
             sys.exit(1)
 
     def get_diff(self) -> Dict[str, List[int]]:
@@ -70,7 +79,73 @@ class LLMReviewer:
             Dict[str, List[int]]: A dictionary mapping file paths to lists of changed line numbers.
                 Example: {"src/file.py": [10, 11, 12], "other/file.py": [5, 6]}
         """
-        # Returns dict: {file_path: [changed_line_numbers]}
+        try:
+            # Use GitPython's diff functionality instead of manual parsing
+            base_commit = self.repo.commit(f"origin/{self.base_branch}")
+            head_commit = self.repo.head.commit
+
+            # Get the diff between base and head
+            diff_index = base_commit.diff(head_commit)
+
+            file_diffs = {}
+            for diff_item in diff_index:
+                # Skip deleted files
+                if diff_item.deleted_file:
+                    continue
+
+                file_path = diff_item.b_path or diff_item.a_path
+                if not file_path:
+                    continue
+
+                # Get the unified diff for this file to extract line numbers
+                try:
+                    unified_diff = self.repo.git.diff(
+                        f"origin/{self.base_branch}...HEAD",
+                        "--unified=0",
+                        "--no-color",
+                        "--",
+                        file_path,
+                    )
+                    changed_lines = self._parse_unified_diff_lines(unified_diff)
+                    if changed_lines:
+                        file_diffs[file_path] = changed_lines
+                except Exception:
+                    # Fallback: if we can't get line numbers, include the file without line info
+                    file_diffs[file_path] = []
+
+            return file_diffs
+
+        except Exception:
+            # Fallback to original method if GitPython approach fails
+            return self._get_diff_fallback()
+
+    def _parse_unified_diff_lines(self, unified_diff: str) -> List[int]:
+        """
+        Parse unified diff output to extract added line numbers.
+
+        Args:
+            unified_diff (str): Unified diff output for a single file.
+
+        Returns:
+            List[int]: List of line numbers that were added or modified.
+        """
+        changed_lines = []
+        for line in unified_diff.splitlines():
+            if line.startswith("@@"):
+                match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                if match:
+                    start = int(match.group(1))
+                    length = int(match.group(2)) if match.group(2) else 1
+                    changed_lines.extend(range(start, start + length))
+        return changed_lines
+
+    def _get_diff_fallback(self) -> Dict[str, List[int]]:
+        """
+        Fallback method using the original manual parsing approach.
+
+        Returns:
+            Dict[str, List[int]]: Dictionary mapping file paths to changed line numbers.
+        """
         diff = self.repo.git.diff(f"origin/{self.base_branch}...HEAD", "--unified=0", "--no-color")
         file_diffs = {}
         current_file = None
@@ -98,7 +173,16 @@ class LLMReviewer:
         Returns:
             str: The complete git diff output with context lines.
         """
-        return self.repo.git.diff(f"origin/{self.base_branch}...HEAD", "--no-color")
+        try:
+            # Use GitPython to get a more robust diff
+            return self.repo.git.diff(f"origin/{self.base_branch}...HEAD", "--no-color")
+        except Exception:
+            # Fallback to comparing with local base branch if remote fails
+            try:
+                return self.repo.git.diff(f"{self.base_branch}...HEAD", "--no-color")
+            except Exception:
+                # Last resort: compare with HEAD~1 if base branch is not available
+                return self.repo.git.diff("HEAD~1", "--no-color")
 
     def run_pyright_on_files(self, files: Dict[str, List[int]]) -> Dict[str, Dict[int, List[str]]]:
         """
@@ -115,20 +199,39 @@ class LLMReviewer:
                 - Inner value: list of pyright issue messages for that line
                 Example: {"src/file.py": {10: ["error: undefined variable"], 11: []}}
         """
-        # Returns: {file_path: {line: [pyright_issues]}}
         results = {}
+        working_dir = Path(self.repo.working_tree_dir or ".")
+
         for file, lines in files.items():
-            working_dir = Path(self.repo.working_tree_dir or ".")
-            rel_path = Path(file).resolve().relative_to(working_dir)
             try:
+                file_path = Path(file)
+                # Handle absolute vs relative paths more robustly
+                if file_path.is_absolute():
+                    rel_path = file_path.relative_to(working_dir)
+                else:
+                    rel_path = file_path
+
+                # Skip files that don't exist or aren't Python files
+                full_path = working_dir / rel_path
+                if not full_path.exists() or not str(rel_path).endswith((".py", ".pyi")):
+                    results[file] = {}
+                    continue
+
                 output = subprocess.check_output(
                     ["pyright", str(rel_path)],
                     cwd=str(working_dir),
                     stderr=subprocess.STDOUT,
                     universal_newlines=True,
+                    timeout=30,  # Add timeout to prevent hanging
                 )
             except subprocess.CalledProcessError as e:
-                output = e.output
+                output = e.output or ""
+            except (subprocess.TimeoutExpired, FileNotFoundError, ValueError) as e:
+                # Handle pyright not being available or other issues
+                print(f"Warning: Could not run pyright on {file}: {e}", file=sys.stderr)
+                results[file] = {}
+                continue
+
             issues = self.parse_pyright_output(output, lines)
             results[file] = issues
         return results
@@ -147,17 +250,35 @@ class LLMReviewer:
                 Only includes lines that are in the interested_lines list.
                 Example: {10: ["error: undefined variable"], 15: ["warning: unused import"]}
         """
-        # Parse pyright output, collect messages for interested lines
         result = {}
+        if not pyright_output or not interested_lines:
+            return result
+
         for line in pyright_output.splitlines():
-            # Typical: path/to/file.py:12:5 - error X: description
-            if ":" in line:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+
+            # Enhanced parsing for different pyright output formats
+            # Typical formats:
+            # path/to/file.py:12:5 - error: description
+            # file.py:12:5 - warning: description
+            # /absolute/path/file.py:12:5 - info: description
+            try:
                 parts = line.split(":")
                 if len(parts) >= 3 and parts[1].isdigit():
                     line_num = int(parts[1])
                     if line_num in interested_lines:
+                        # Join the message part (everything after the second colon)
                         msg = ":".join(parts[2:]).strip()
+                        # Clean up common pyright prefixes
+                        if msg.startswith(" - "):
+                            msg = msg[3:]
                         result.setdefault(line_num, []).append(msg)
+            except (ValueError, IndexError):
+                # Skip malformed lines
+                continue
+
         return result
 
     def get_instructions(self, instructions_path: Optional[str] = None) -> str:
